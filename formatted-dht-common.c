@@ -10257,3 +10257,45 @@ dht_remove_stale_linkto_cbk (int ret, call_frame_t *sync_frame, void *data) {
     DHT_STACK_DESTROY (sync_frame);
     return 0;
 }
+
+int
+sample_function_with_switch_case (int abcd, dict_t *options,
+                                  gf_boolean_t abcd1) {
+    int ret = -1;
+
+    switch (abcd) {
+    case 1:
+        ret = dict_set_static_ptr (options, "test-abcd", "on");
+        if (ret < 0) {
+            gf_msg ("glusterfsd", GF_LOG_ERROR, 0, 0,
+                    "failed to set dict value for key "
+                    "test-abcd");
+            goto err;
+        }
+        break;
+    case 0:
+        ret = dict_set_static_ptr (options, "test-abcd", "off");
+        if (ret < 0) {
+            gf_msg ("glusterfsd", GF_LOG_ERROR, 0, 0,
+                    "failed to set dict value for key "
+                    "test-abcd");
+            goto err;
+        }
+        break;
+    case -1:
+    default:
+        gf_msg_debug ("glusterfsd", 0, "test-abcd mode %d", abcd);
+        break;
+    }
+    if (abcd1) {
+        ret = dict_set_uint32 (options, "another-abcd", abcd1);
+        if (ret < 0) {
+            gf_msg ("glusterfsd", GF_LOG_ERROR, 0, 0,
+                    "failed to set dict value for key "
+                    "another-abcd");
+            goto err;
+        }
+    }
+err:
+    return ret;
+}
