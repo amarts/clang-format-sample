@@ -9,8 +9,6 @@
 */
 
 
-/* TODO: add NS locking */
-
 #include "glusterfs.h"
 #include "xlator.h"
 #include "libxlator.h"
@@ -27,7 +25,101 @@
 
 int run_defrag = 0;
 
+#define GF_XATTR_TIER_LAYOUT_FIXED_KEY  "trusted.tier.fix.layout.complete"
+#define GF_XATTR_FILE_MIGRATE_KEY       "trusted.distribute.migrate-data"
+#define DHT_MDS_STR                     "mds"
+#define GF_DHT_LOOKUP_UNHASHED_OFF      0
+#define GF_DHT_LOOKUP_UNHASHED_ON       1
+#define GF_DHT_LOOKUP_UNHASHED_AUTO     2
+#define DHT_PATHINFO_HEADER             "DISTRIBUTE:"
+#define DHT_FILE_MIGRATE_DOMAIN         "dht.file.migrate"
 
+
+struct dht_layout {
+        int                spread_cnt;  /* layout spread count per directory,
+                                           is controlled by 'setxattr()' with
+                                           special key */
+        int                cnt;
+        int                preset;
+        /*
+         * The last *configuration* state for which this directory was known
+         * to be in balance.  The corresponding vol_commit_hash changes
+         * whenever bricks are added or removed.  This value changes when a
+         * (full) rebalance is complete.  If they match, it's safe to assume
+         * that every file is where it should be and there's no need to do
+         * lookups for files elsewhere.  If they don't, then we have to do a
+         * global lookup to be sure.
+         */
+        uint32_t           commit_hash;
+        /*
+         * The *runtime* state of the volume, changes when connections to
+         * bricks are made or lost.
+         */
+        int                gen;
+        int                type;
+        gf_atomic_t        ref; /* use with dht_conf_t->layout_lock */
+        uint32_t           search_unhashed;
+        struct {
+                int        err;   /* 0 = normal
+                                     -1 = dir exists and no xattr
+                                     >0 = dir lookup failed with errno
+                                  */
+                uint32_t   start;
+                uint32_t   stop;
+                uint32_t   commit_hash;
+                xlator_t  *xlator;
+        } list[];
+};
+typedef struct dht_layout  dht_layout_t;
+
+struct dht_container {
+        union {
+                struct list_head             list;
+                struct {
+                        struct _gf_dirent_t *next;
+                        struct _gf_dirent_t *prev;
+                };
+        };
+        gf_dirent_t     *df_entry;
+        xlator_t        *this;
+        loc_t           *parent_loc;
+        dict_t          *migrate_data;
+        int             local_subvol_index;
+};
+
+
+struct dht_methods_s {
+        int32_t      (*migration_get_dst_subvol)(xlator_t *this,
+                                                 dht_local_t *local);
+        int32_t      (*migration_other)(xlator_t *this,
+                                        gf_defrag_info_t *defrag);
+        int32_t      (*migration_needed)(xlator_t *this);
+        xlator_t*    (*layout_search)(xlator_t *this,
+                                      dht_layout_t *layout,
+                                         const char *name);
+};
+
+typedef struct dht_methods_s dht_methods_t;
+
+
+#define is_greater_time(a, an, b, bn) (((a) < (b)) || (((a) == (b)) && ((an) < (bn))))
+
+#define DHT_MARK_FOP_INTERNAL(xattr) do {                                      \
+                int tmp = -1;                                                  \
+                if (!xattr) {                                                  \
+                        xattr = dict_new ();                                   \
+                        if (!xattr)                                            \
+                                break;                                         \
+                }                                                              \
+                tmp = dict_set_str (xattr, GLUSTERFS_INTERNAL_FOP_KEY, "yes"); \
+                if (tmp) {                                                     \
+                        gf_msg (this->name, GF_LOG_ERROR, 0,                   \
+                                DHT_MSG_DICT_SET_FAILED,                       \
+                                "Failed to set dictionary value: key = %s,"    \
+                                " path = %s", GLUSTERFS_INTERNAL_FOP_KEY,      \
+                                 local->loc.path);                             \
+                }                                                              \
+        } while (0)
 
 int dht_link2 (xlator_t *this, xlator_t *dst_node, call_frame_t *frame,
                int ret);
@@ -35,50 +127,6 @@ int dht_link2 (xlator_t *this, xlator_t *dst_node, call_frame_t *frame,
 int
 dht_removexattr2 (xlator_t *this, xlator_t *subvol, call_frame_t *frame,
                   int ret);
-
-int
-dht_setxattr2 (xlator_t *this, xlator_t *subvol, call_frame_t *frame,
-               int ret);
-
-
-int
-dht_rmdir_readdirp_do (call_frame_t *readdirp_frame, xlator_t *this);
-
-
-int
-dht_common_xattrop_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
-                        int32_t op_ret, int32_t op_errno, dict_t *dict,
-                        dict_t *xdata);
-
-
-/* Sets the blocks and size values to fixed values. This is to be called
- * only for dirs. The caller is responsible for checking the type
- */
-int32_t dht_set_fixed_dir_stat (struct iatt *stat)
-{
-        if (stat) {
-                stat->ia_blocks = DHT_DIR_STAT_BLOCKS;
-                stat->ia_size = DHT_DIR_STAT_SIZE;
-                return 0;
-        }
-        return -1;
-}
-
-
-/* Set both DHT_IATT_IN_XDATA_KEY and DHT_MODE_IN_XDATA_KEY
- * Use DHT_MODE_IN_XDATA_KEY if available. Else fall back to
- * DHT_IATT_IN_XDATA_KEY
- */
-int dht_request_iatt_in_xdata (xlator_t *this, dict_t *xattr_req)
-{
-        int ret = -1;
-
-        ret = dict_set_int8 (xattr_req, DHT_MODE_IN_XDATA_KEY, 1);
-        ret = dict_set_int8 (xattr_req, DHT_IATT_IN_XDATA_KEY, 1);
-
-        /* At least one call succeeded */
-        return ret;
-}
 
 
 /* Get both DHT_IATT_IN_XDATA_KEY and DHT_MODE_IN_XDATA_KEY
@@ -104,11 +152,6 @@ int dht_read_iatt_from_xdata (xlator_t *this, dict_t *xdata,
 
         return ret;
 }
-
-
-
-int
-dht_rmdir_unlock (call_frame_t *frame, xlator_t *this);
 
 char *xattrs_to_heal[] = {
         "user.",
@@ -430,53 +473,6 @@ dht_aggregate (dict_t *this, char *key, data_t *value, void *data)
         }
 
 out:
-        return ret;
-}
-
-
-void
-dht_aggregate_xattr (dict_t *dst, dict_t *src)
-{
-        if ((dst == NULL) || (src == NULL)) {
-                goto out;
-        }
-
-        dict_foreach (src, dht_aggregate, dst);
-out:
-        return;
-}
-
-/* Code to save hashed subvol on inode ctx as a mds subvol
-*/
-int
-dht_inode_ctx_mdsvol_set (inode_t *inode, xlator_t *this, xlator_t *mds_subvol)
-{
-        dht_inode_ctx_t         *ctx            = NULL;
-        int                      ret            = -1;
-        uint64_t                 ctx_int        = 0;
-        gf_boolean_t             ctx_free       = _gf_false;
-
-
-        LOCK (&inode->lock);
-        {
-                ret = __inode_ctx_get (inode, this , &ctx_int);
-                if (ctx_int) {
-                        ctx = (dht_inode_ctx_t *)ctx_int;
-                        ctx->mds_subvol = mds_subvol;
-                } else {
-                        ctx = GF_CALLOC (1, sizeof(*ctx), gf_dht_mt_inode_ctx_t);
-                        if (!ctx)
-                                goto unlock;
-                        ctx->mds_subvol = mds_subvol;
-                        ctx_free        = _gf_true;
-                        ctx_int = (long) ctx;
-                        ret =  __inode_ctx_set (inode, this, &ctx_int);
-                }
-        }
-unlock:
-        UNLOCK (&inode->lock);
-        if (ret && ctx_free)
-                GF_FREE (ctx);
         return ret;
 }
 
